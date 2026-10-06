@@ -1,0 +1,204 @@
+# Publishes edge-setup releases.
+#
+# Source location and deploy key are repository secrets. These logs are
+# public: build and test output stays on the runner, only step names and
+# results are printed. Inputs reach the shell through the environment.
+name: publish
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Only this tag (vX.Y.Z), built even if already released"
+        required: false
+        default: ""
+      dry_run:
+        description: "Build and verify, publish nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: publish
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish missing releases
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+      SOURCE_DIR: ${{ secrets.SOURCE_DIR }}
+      GH_TOKEN: ${{ github.token }}
+      INPUT_TAG: ${{ github.event.inputs.tag || '' }}
+      DRY_RUN: ${{ github.event.inputs.dry_run == 'true' && 'true' || 'false' }}
+    steps:
+      - name: Load the read-only deploy key
+        env:
+          OHBOT_DEPLOY_KEY: ${{ secrets.OHBOT_DEPLOY_KEY }}
+        run: |
+          set -euo pipefail
+          for name in OHBOT_DEPLOY_KEY SOURCE_REPO SOURCE_DIR; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::secret $name is missing" >&2
+              exit 2
+            fi
+          done
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          curl -fsS https://api.github.com/meta \
+            | jq -r '.ssh_keys[] | "github.com " + .' > ~/.ssh/known_hosts
+          sock="$RUNNER_TEMP/ssh-agent.sock"
+          eval "$(ssh-agent -a "$sock")" >/dev/null
+          printf '%s\n' "$OHBOT_DEPLOY_KEY" | ssh-add -q -
+          echo "SSH_AUTH_SOCK=$sock" >> "$GITHUB_ENV"
+          echo "SSH_AGENT_PID=$SSH_AGENT_PID" >> "$GITHUB_ENV"
+
+      - name: List the tags to publish
+        id: plan
+        run: |
+          set -euo pipefail
+          stable='^v[0-9]+\.[0-9]+\.[0-9]+$'
+          remote_tags="$(git ls-remote --tags --refs "$SOURCE_REPO" 'v*' \
+            | sed 's#.*refs/tags/##' | grep -E "$stable" | sort -V || true)"
+          if [ -z "$remote_tags" ]; then
+            echo "::error::no stable vX.Y.Z tag found on the source repository" >&2
+            exit 2
+          fi
+          released="$(gh release list -R "$GITHUB_REPOSITORY" --limit 1000 \
+            --json tagName --jq '.[].tagName')"
+          if [ -n "$INPUT_TAG" ]; then
+            if ! printf '%s\n' "$INPUT_TAG" | grep -Eq "$stable"; then
+              echo "::error::tag input must be vX.Y.Z" >&2
+              exit 2
+            fi
+            if ! printf '%s\n' "$remote_tags" | grep -qxF "$INPUT_TAG"; then
+              echo "::error::$INPUT_TAG is not a tag of the source repository" >&2
+              exit 2
+            fi
+            todo="$INPUT_TAG"
+          else
+            # Only tags above the newest release.
+            newest="$(printf '%s\n' "$released" | grep -E "$stable" | sort -V | tail -n 1 || true)"
+            todo="$(printf '%s\n' "$remote_tags" \
+              | grep -vxF -f <(printf '%s\n' "$released") \
+              | while read -r t; do
+                  if [ -z "$newest" ] || [ "$(printf '%s\n%s\n' "$newest" "$t" | sort -V | tail -n 1)" = "$t" ]; then
+                    echo "$t"
+                  fi
+                done || true)"
+          fi
+          todo="$(printf '%s\n' "$todo" | sed '/^$/d' | tr '\n' ' ' | sed 's/ $//')"
+          latest="$(printf '%s\n' "$remote_tags" | tail -n 1)"
+          echo "latest source tag: $latest; to build: ${todo:-none}; dry_run: $DRY_RUN"
+          {
+            echo "### edge-setup publish"
+            echo
+            echo "- latest source tag: \`$latest\`"
+            echo "- to build: ${todo:-none}"
+            echo "- dry run: $DRY_RUN"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "tags=$todo" >> "$GITHUB_OUTPUT"
+
+      - name: Clone the source with its full history
+        if: steps.plan.outputs.tags != ''
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none --no-checkout "$SOURCE_REPO" "$RUNNER_TEMP/src"
+
+      - uses: actions/setup-go@v5
+        if: steps.plan.outputs.tags != ''
+        with:
+          go-version: stable
+          check-latest: true
+          cache: false
+
+      - name: Build, verify and publish
+        if: steps.plan.outputs.tags != ''
+        env:
+          TAGS: ${{ steps.plan.outputs.tags }}
+        run: |
+          set -euo pipefail
+          src="$RUNNER_TEMP/src"
+          log="$RUNNER_TEMP/step.log"
+          quiet() {
+            if ! "$@" >"$log" 2>&1; then
+              echo "::error::$tag: $* failed" >&2
+              exit 2
+            fi
+          }
+          for tag in $TAGS; do
+            echo "::group::$tag"
+            git -C "$src" checkout -q --force --detach "refs/tags/$tag"
+            git -C "$src" clean -qfdx
+            described="$(git -C "$src" describe --tags --exact-match)"
+            if [ "$described" != "$tag" ]; then
+              echo "::error::$tag: git describe returns $described" >&2
+              exit 2
+            fi
+            if [ ! -d "$src/$SOURCE_DIR" ]; then
+              echo "::error::$tag: source directory missing at this tag" >&2
+              exit 2
+            fi
+            cd "$src/$SOURCE_DIR"
+            quiet make test
+            quiet make test-release
+            quiet make build-all VERSION="$tag"
+            (cd dist && quiet sha256sum -c SHA256SUMS)
+            assets="$(make --no-print-directory release-assets)"
+            count=0
+            for f in $assets; do
+              [ -s "$f" ] || { echo "::error::$tag: missing asset $f" >&2; exit 2; }
+              count=$((count + 1))
+            done
+            if [ "$count" -ne 9 ]; then
+              echo "::error::$tag: expected 9 assets, got $count" >&2
+              exit 2
+            fi
+            echo "$tag: 9 assets built and verified"
+            if [ "$DRY_RUN" = "true" ]; then
+              echo "$tag: dry run, nothing published"
+              echo "- $tag: built and verified, dry run" >> "$GITHUB_STEP_SUMMARY"
+            elif gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "$tag: release already exists, skipped"
+              echo "- $tag: already released, skipped" >> "$GITHUB_STEP_SUMMARY"
+            else
+              notes="$(mktemp)"
+              {
+                echo "edge-setup $tag"
+                echo
+                awk -v v="$tag" '$0 ~ "^## " v " " || $0 == "## " v {f=1; next} f && /^## /{exit} f' CHANGELOG.md
+                echo
+                echo '```'
+                cat dist/SHA256SUMS
+                echo '```'
+              } > "$notes"
+              # Only a tag above every stable release takes the Latest mark.
+              newest="$(gh release list -R "$GITHUB_REPOSITORY" --limit 1000 \
+                --json tagName --jq '.[].tagName' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+              latest_flag="--latest=false"
+              if [ -z "$newest" ] || [ "$(printf '%s\n%s\n' "$newest" "$tag" | sort -V | tail -n 1)" = "$tag" ]; then
+                latest_flag="--latest"
+              fi
+              if ! gh release create "$tag" $assets -R "$GITHUB_REPOSITORY" "$latest_flag" \
+                --title "edge-setup $tag" --notes-file "$notes"; then
+                gh release view "$tag" -R "$GITHUB_REPOSITORY" >/dev/null
+                echo "$tag: created concurrently, kept as is"
+              fi
+              url="$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json url --jq .url)"
+              echo "$tag: published $url"
+              echo "- $tag: published $url" >> "$GITHUB_STEP_SUMMARY"
+            fi
+            cd "$GITHUB_WORKSPACE"
+            echo "::endgroup::"
+          done
+
+      - name: Stop the SSH agent
+        if: always()
+        run: |
+          if [ -n "${SSH_AGENT_PID:-}" ]; then ssh-agent -k >/dev/null || true; fi
